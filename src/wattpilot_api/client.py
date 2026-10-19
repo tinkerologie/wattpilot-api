@@ -205,6 +205,9 @@ class Wattpilot:
                     raise ConnectionError(msg) from exc
             return
 
+        if self._message_loop_task is not None or self._ws is not None:
+            await self.disconnect()
+
         self._connected_event.clear()
         self._initialized_event.clear()
         self._auth_error = None
