@@ -89,6 +89,7 @@ class Wattpilot:
 
         self._connected_event = asyncio.Event()
         self._initialized_event = asyncio.Event()
+        self._transport_drop_event = asyncio.Event()
         self._auth_error: AuthenticationError | ConnectionError | None = None
         self._transport_error: Exception | None = None
         self._handshake_pending = False
@@ -134,10 +135,16 @@ class Wattpilot:
     # ---- Context manager ----
 
     async def __aenter__(self) -> Wattpilot:
-        await self.connect()
+        """Enter the async context manager by connecting."""
+        try:
+            await self.connect()
+        except BaseException:
+            await self.disconnect()
+            raise
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        """Exit the async context manager by disconnecting."""
         await self.disconnect()
 
     # ---- Connection lifecycle ----
@@ -162,16 +169,20 @@ class Wattpilot:
             raise err
 
         event_wait_task = asyncio.create_task(event.wait())
+        drop_wait_task = asyncio.create_task(self._transport_drop_event.wait())
         try:
-            await asyncio.wait(
-                {event_wait_task, loop_task},
+            done, _ = await asyncio.wait(
+                {event_wait_task, drop_wait_task, loop_task},
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
             event_wait_task.cancel()
+            drop_wait_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await event_wait_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await drop_wait_task
 
         if self._auth_error is not None:
             await self.disconnect()
@@ -180,8 +191,9 @@ class Wattpilot:
         if event is self._connected_event and event.is_set():
             return
 
-        if loop_task.done():
-            await self.disconnect()
+        if drop_wait_task in done or self._transport_drop_event.is_set() or loop_task.done():
+            if not self._auto_reconnect:
+                await self.disconnect()
             err = ConnectionError(lost_msg)
             if self._transport_error is not None:
                 err.__cause__ = self._transport_error
@@ -210,6 +222,7 @@ class Wattpilot:
 
         self._connected_event.clear()
         self._initialized_event.clear()
+        self._transport_drop_event.clear()
         self._auth_error = None
         self._transport_error = None
         self._handshake_pending = True
@@ -258,6 +271,8 @@ class Wattpilot:
         self._connected = False
         self._connected_event.clear()
         self._initialized_event.clear()
+        self._transport_drop_event.clear()
+        self._all_props_initialized = False
 
     # ---- Read-only properties ----
 
@@ -931,6 +946,11 @@ class Wattpilot:
                 except websockets.exceptions.ConnectionClosed as exc:
                     _LOGGER.info("WebSocket connection closed")
                     self._transport_error = exc
+                    self._transport_drop_event.set()
+                else:
+                    if self._auth_error is None:
+                        _LOGGER.info("WebSocket connection closed normally")
+                        self._transport_drop_event.set()
 
                 self._connected = False
                 if not self._handshake_pending and self._auth_error is None:
@@ -948,17 +968,13 @@ class Wattpilot:
                     )
                     break
 
-                if self._handshake_pending:
-                    _LOGGER.info(
-                        "Connection lost during initial handshake; exiting loop without reconnect"
-                    )
-                    break
-
                 _LOGGER.info("Reconnecting in %.0fs...", reconnect_delay)
                 await asyncio.sleep(reconnect_delay)
                 try:
                     self._all_props_initialized = False
+                    self._connected_event.clear()
                     self._initialized_event.clear()
+                    self._transport_drop_event.clear()
                     self._ws = await websockets.asyncio.client.connect(self._url)
                     reconnect_delay = self._reconnect_delay_min
                 except (OSError, websockets.exceptions.WebSocketException) as exc:
