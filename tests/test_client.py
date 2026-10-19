@@ -1447,7 +1447,9 @@ class TestAuthHandshakeConnectionDrop:
         assert wp.connected is False
         assert isinstance(wp._auth_error, AuthenticationError)
 
-    async def test_connect_disconnects_existing_loop_task_before_handshake(self) -> None:
+    async def test_connect_disconnects_existing_loop_task_before_handshake(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Calling connect() when a previous loop task or socket exists disconnects it first."""
         wp = Wattpilot("host", "secret")
         cancelled = False
@@ -1465,8 +1467,10 @@ class TestAuthHandshakeConnectionDrop:
         wp._message_loop_task = old_task
         wp._connected = False
 
-        # Attempt connect with an invalid URL to fail fast after disconnect
-        wp._url = "ws://127.0.0.1:0/invalid"
+        async def failing_connect(url: str) -> Any:
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(websockets.asyncio.client, "connect", failing_connect)
         with pytest.raises(OSError):
             await wp.connect()
 
