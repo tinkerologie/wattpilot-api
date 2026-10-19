@@ -72,6 +72,7 @@ class Wattpilot:
 
         self._device = DeviceInfo(serial=serial or "")
         self._hashed_password: bytes = b""
+        self._hashed_password_key: tuple[str, str, AuthHashType] | None = None
         self._auth_hash_type = AuthHashType.PBKDF2
 
         if cloud:
@@ -89,6 +90,8 @@ class Wattpilot:
         self._connected_event = asyncio.Event()
         self._initialized_event = asyncio.Event()
         self._auth_error: AuthenticationError | ConnectionError | None = None
+        self._transport_error: Exception | None = None
+        self._handshake_pending = False
 
         # Named property caches
         self._voltage1: float | None = None
@@ -128,10 +131,6 @@ class Wattpilot:
         self._property_callbacks: list[PropertyCallback] = []
         self._message_callbacks: list[MessageCallback] = []
 
-        # Pre-hash password if serial is already known
-        if serial:
-            self._update_hashed_password()
-
     # ---- Context manager ----
 
     async def __aenter__(self) -> Wattpilot:
@@ -142,6 +141,57 @@ class Wattpilot:
         await self.disconnect()
 
     # ---- Connection lifecycle ----
+
+    async def _wait_for_connect_event(
+        self,
+        event: asyncio.Event,
+        timeout: float,
+        timeout_msg: str,
+        lost_msg: str,
+    ) -> None:
+        """Wait for an authentication/initialization event or message loop exit."""
+        loop_task = self._message_loop_task
+        if loop_task is None or loop_task.done():
+            if self._auth_error is not None:
+                await self.disconnect()
+                raise self._auth_error
+            await self.disconnect()
+            err = ConnectionError(lost_msg)
+            if self._transport_error is not None:
+                err.__cause__ = self._transport_error
+            raise err
+
+        event_wait_task = asyncio.create_task(event.wait())
+        try:
+            await asyncio.wait(
+                {event_wait_task, loop_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            event_wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await event_wait_task
+
+        if self._auth_error is not None:
+            await self.disconnect()
+            raise self._auth_error
+
+        if event is self._connected_event and event.is_set():
+            return
+
+        if loop_task.done():
+            await self.disconnect()
+            err = ConnectionError(lost_msg)
+            if self._transport_error is not None:
+                err.__cause__ = self._transport_error
+            raise err
+
+        if event.is_set():
+            return
+
+        await self.disconnect()
+        raise ConnectionError(timeout_msg)
 
     async def connect(self) -> None:
         """Open the WebSocket and authenticate."""
@@ -158,37 +208,37 @@ class Wattpilot:
         self._connected_event.clear()
         self._initialized_event.clear()
         self._auth_error = None
+        self._transport_error = None
+        self._handshake_pending = True
 
-        self._ws = await websockets.asyncio.client.connect(self._url)
-        self._message_loop_task = asyncio.create_task(self._message_loop())
-        self._message_loop_task.add_done_callback(
-            lambda t: (
-                _LOGGER.error("Message loop task failed: %s", t.exception())
-                if not t.cancelled() and t.exception() is not None
-                else None
+        try:
+            self._ws = await websockets.asyncio.client.connect(self._url)
+            self._message_loop_task = asyncio.create_task(self._message_loop())
+            self._message_loop_task.add_done_callback(
+                lambda t: (
+                    _LOGGER.error("Message loop task failed: %s", t.exception())
+                    if not t.cancelled() and t.exception() is not None
+                    else None
+                )
             )
-        )
 
-        try:
-            await asyncio.wait_for(self._connected_event.wait(), self._connect_timeout)
-        except TimeoutError as exc:
-            await self.disconnect()
-            msg = "Timeout waiting for authentication"
-            raise ConnectionError(msg) from exc
+            await self._wait_for_connect_event(
+                self._connected_event,
+                self._connect_timeout,
+                "Timeout waiting for authentication",
+                "Connection lost during authentication",
+            )
 
-        if self._auth_error is not None:
-            err = self._auth_error
-            await self.disconnect()
-            raise err
+            await self._wait_for_connect_event(
+                self._initialized_event,
+                self._init_timeout,
+                "Timeout waiting for property initialization",
+                "Connection lost before property initialization",
+            )
 
-        try:
-            await asyncio.wait_for(self._initialized_event.wait(), self._init_timeout)
-        except TimeoutError as exc:
-            await self.disconnect()
-            msg = "Timeout waiting for property initialization"
-            raise ConnectionError(msg) from exc
-
-        _LOGGER.info("Connected to Wattpilot %s", self._device.serial)
+            _LOGGER.info("Connected to Wattpilot %s", self._device.serial)
+        finally:
+            self._handshake_pending = False
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection."""
@@ -854,19 +904,34 @@ class Wattpilot:
                             raw = raw.decode("utf-8")
                         try:
                             await self._handle_message(raw)
+                        except websockets.exceptions.ConnectionClosed:
+                            raise
                         except Exception as exc:
                             _LOGGER.exception("Error handling message: %s", exc)
                             if not self._connected_event.is_set():
-                                if isinstance(exc, (AuthenticationError, ConnectionError)):
+                                if self._handshake_pending:
+                                    if isinstance(exc, AuthenticationError | ConnectionError):
+                                        self._auth_error = exc
+                                    else:
+                                        wrapped = ConnectionError(f"Error during handshake: {exc}")
+                                        wrapped.__cause__ = exc
+                                        self._auth_error = wrapped
+                                    self._connected_event.set()
+                                elif isinstance(exc, AuthenticationError):
                                     self._auth_error = exc
-                                else:
-                                    self._auth_error = AuthenticationError(str(exc))
-                                self._connected_event.set()
-                except websockets.exceptions.ConnectionClosed:
+                                    self._connected_event.set()
+                        if self._auth_error is not None and (
+                            self._handshake_pending
+                            or isinstance(self._auth_error, AuthenticationError)
+                        ):
+                            break
+                except websockets.exceptions.ConnectionClosed as exc:
                     _LOGGER.info("WebSocket connection closed")
+                    self._transport_error = exc
 
                 self._connected = False
-                self._connected_event.clear()
+                if not self._handshake_pending and self._auth_error is None:
+                    self._connected_event.clear()
 
                 if not self._auto_reconnect:
                     break
@@ -877,6 +942,12 @@ class Wattpilot:
                     _LOGGER.error(
                         "Not reconnecting after authentication failure: %s",
                         self._auth_error,
+                    )
+                    break
+
+                if self._handshake_pending:
+                    _LOGGER.info(
+                        "Connection lost during initial handshake; exiting loop without reconnect"
                     )
                     break
 
@@ -892,7 +963,7 @@ class Wattpilot:
                     _LOGGER.warning("Reconnect failed: %s, retrying in %.0fs", exc, reconnect_delay)
         finally:
             self._connected = False
-            if self._auth_error is None:
+            if not self._handshake_pending and self._auth_error is None:
                 self._connected_event.clear()
 
     async def _handle_message(self, raw: str) -> None:
@@ -964,7 +1035,12 @@ class Wattpilot:
         else:
             self._auth_hash_type = AuthHashType.PBKDF2
 
-        self._update_hashed_password()
+        try:
+            await self._ensure_hashed_password()
+        except Exception as exc:
+            msg_err = f"Password hashing failed: {exc}"
+            _LOGGER.error(msg_err)
+            raise AuthenticationError(msg_err) from exc
         if not self._hashed_password:
             msg_err = "Cannot authenticate: password or device serial is missing"
             _LOGGER.error(msg_err)
@@ -1091,12 +1167,22 @@ class Wattpilot:
             else:
                 cb(name, value)
 
-    def _update_hashed_password(self) -> None:
+    async def _ensure_hashed_password(self) -> None:
+        """Ensure password hash is computed and cached for current credentials."""
         if not self._password or not self._device.serial:
+            self._hashed_password = b""
+            self._hashed_password_key = None
             return
-        self._hashed_password = hash_password(
-            self._password, self._device.serial, self._auth_hash_type
+
+        cache_key = (self._password, self._device.serial, self._auth_hash_type)
+        if cache_key == self._hashed_password_key and self._hashed_password:
+            return
+
+        hashed = await asyncio.to_thread(
+            hash_password, self._password, self._device.serial, self._auth_hash_type
         )
+        self._hashed_password = hashed
+        self._hashed_password_key = cache_key
 
     async def _send(self, message: dict[str, Any], *, secure: bool = False) -> None:
         if self._ws is None:

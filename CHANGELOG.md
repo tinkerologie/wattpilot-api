@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configured Codecov GitHub Actions workflow for tokenless coverage uploads
 
 ### Fixed
+- A transport drop during the initial WebSocket handshake now correctly raises `ConnectionError` instead of being misclassified as an `AuthenticationError`, no longer stops automatic reconnection, and `connect()` detects lost connections during initialization promptly ([#25](https://github.com/tinkerologie/wattpilot-api/issues/25)).
+- Password hash computation (PBKDF2 and bcrypt) is now cached per `(password, serial, hash_type)` and offloaded to a worker thread via `asyncio.to_thread`, eliminating event loop stalls on connection/reconnection and removing redundant constructor hashing ([#26](https://github.com/tinkerologie/wattpilot-api/issues/26)).
 
 ## [1.5.0] - 2026-09-20
 

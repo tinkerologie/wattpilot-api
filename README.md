@@ -203,9 +203,9 @@ from wattpilot_api import WattpilotError, AuthenticationError, ConnectionError
 try:
     await wp.connect()
 except AuthenticationError:
-    print("Wrong password")
+    print("Device or local credentials rejected authentication")
 except ConnectionError:
-    print("Cannot reach device")
+    print("Cannot reach device or connection lost during handshake")
 ```
 
 ## MQTT Bridge

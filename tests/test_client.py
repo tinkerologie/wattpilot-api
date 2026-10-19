@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import datetime
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -14,6 +15,7 @@ import pytest
 import websockets
 import websockets.asyncio.server
 
+import wattpilot_api.client as client_mod
 from wattpilot_api.client import Wattpilot
 from wattpilot_api.exceptions import AuthenticationError, ConnectionError, PropertyError
 from wattpilot_api.models import AuthHashType, CloudInfo, LoadMode
@@ -589,8 +591,9 @@ class TestWattpilotResilienceAndAuth:
         try:
             wp = Wattpilot(SAMPLE_HOST, SAMPLE_PASSWORD, serial=SAMPLE_SERIAL, connect_timeout=1.0)
             wp._url = f"ws://127.0.0.1:{port}/ws"
-            with pytest.raises(AuthenticationError):
+            with pytest.raises(ConnectionError, match="Error during handshake") as exc_info:
                 await wp.connect()
+            assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
         finally:
             server.close()
             await server.wait_closed()
@@ -675,19 +678,31 @@ class TestWattpilotEdgeCases:
         await asyncio.sleep(0.1)
         assert wattpilot_client.wifi_ssid == "Existing"
 
-    def test_update_hashed_password_empty_password(self) -> None:
-        """Cover the early return in _update_hashed_password."""
-        wp = Wattpilot("host", "")
-        wp._device.serial = "12345678"
-        wp._update_hashed_password()
-        assert wp._hashed_password == b""
-
-    def test_update_hashed_password_empty_serial(self) -> None:
-        """Cover the early return in _update_hashed_password."""
+    async def test_ensure_hashed_password_empty_password(self) -> None:
+        """Cover early return and cache clearing in helper when password is empty."""
         wp = Wattpilot("host", "password")
-        wp._device.serial = ""
-        wp._update_hashed_password()
+        wp._device.serial = "12345678"
+        await wp._ensure_hashed_password()
+        assert wp._hashed_password != b""
+        assert wp._hashed_password_key is not None
+
+        wp._password = ""
+        await wp._ensure_hashed_password()
         assert wp._hashed_password == b""
+        assert wp._hashed_password_key is None
+
+    async def test_ensure_hashed_password_empty_serial(self) -> None:
+        """Cover early return and cache clearing in helper when serial is empty."""
+        wp = Wattpilot("host", "password")
+        wp._device.serial = "12345678"
+        await wp._ensure_hashed_password()
+        assert wp._hashed_password != b""
+        assert wp._hashed_password_key is not None
+
+        wp._device.serial = ""
+        await wp._ensure_hashed_password()
+        assert wp._hashed_password == b""
+        assert wp._hashed_password_key is None
 
 
 class TestWattpilotAuthVariants:
@@ -911,6 +926,560 @@ class TestWattpilotConnectionClosed:
         # Must return promptly (break) rather than sleeping and retrying forever.
         await asyncio.wait_for(wp._message_loop(), timeout=1.0)
         assert wp.connected is False
+
+
+class TestPasswordHashCaching:
+    """Tests for issue #26: PBKDF2/bcrypt hash caching and offloading."""
+
+    async def test_no_hashing_in_constructor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Constructing a Wattpilot with serial does not hash password before authentication."""
+        calls: list[tuple[str, str, AuthHashType]] = []
+        orig_hash = client_mod.hash_password
+
+        def counting_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            calls.append((pw, s, ht))
+            return orig_hash(pw, s, ht)
+
+        monkeypatch.setattr(client_mod, "hash_password", counting_hash)
+
+        wp = Wattpilot("host", "secret", serial="12345678")
+        assert len(calls) == 0
+        assert wp._hashed_password == b""
+        assert wp._hashed_password_key is None
+
+    async def test_connect_disconnect_thrice_caches_hash(
+        self, mock_server: MockWattpilotServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Connect and disconnect the same instance three times performs only one hash."""
+        calls: list[tuple[str, str, AuthHashType]] = []
+        orig_hash = client_mod.hash_password
+
+        def counting_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            calls.append((pw, s, ht))
+            return orig_hash(pw, s, ht)
+
+        monkeypatch.setattr(client_mod, "hash_password", counting_hash)
+
+        wp = Wattpilot(
+            SAMPLE_HOST,
+            SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            connect_timeout=5.0,
+            init_timeout=5.0,
+        )
+        wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
+
+        for _ in range(3):
+            await wp.connect()
+            await wp.disconnect()
+
+        assert len(calls) == 1
+        assert calls[0] == (SAMPLE_PASSWORD, SAMPLE_SERIAL, AuthHashType.PBKDF2)
+        assert wp._hashed_password == orig_hash(SAMPLE_PASSWORD, SAMPLE_SERIAL, AuthHashType.PBKDF2)
+
+    async def test_direct_helper_cache_invalidation_and_reuse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Helper caches unchanged inputs and recomputes only when inputs change."""
+        calls: list[tuple[str, str, AuthHashType]] = []
+        orig_hash = client_mod.hash_password
+
+        def counting_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            calls.append((pw, s, ht))
+            return orig_hash(pw, s, ht)
+
+        monkeypatch.setattr(client_mod, "hash_password", counting_hash)
+
+        wp = Wattpilot("host", "secret", serial="12345678")
+        await wp._ensure_hashed_password()
+        assert len(calls) == 1
+
+        # Repeated call with same inputs: no extra hashing
+        await wp._ensure_hashed_password()
+        assert len(calls) == 1
+
+        # Change password: one extra hash
+        wp._password = "newsecret"
+        await wp._ensure_hashed_password()
+        assert len(calls) == 2
+
+        # Repeated call: no extra hash
+        await wp._ensure_hashed_password()
+        assert len(calls) == 2
+
+        # Change serial: one extra hash
+        wp._device.serial = "87654321"
+        await wp._ensure_hashed_password()
+        assert len(calls) == 3
+
+        # Change hash type: one extra hash
+        wp._auth_hash_type = AuthHashType.BCRYPT
+        await wp._ensure_hashed_password()
+        assert len(calls) == 4
+
+        # Repeat: no extra hash
+        await wp._ensure_hashed_password()
+        assert len(calls) == 4
+
+    async def test_auto_reconnect_does_not_rehash(
+        self, mock_server: MockWattpilotServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Auto-reconnect with unchanged hello and algorithm does not compute hash again."""
+        calls: list[tuple[str, str, AuthHashType]] = []
+        orig_hash = client_mod.hash_password
+
+        def counting_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            calls.append((pw, s, ht))
+            return orig_hash(pw, s, ht)
+
+        monkeypatch.setattr(client_mod, "hash_password", counting_hash)
+
+        wp = Wattpilot(
+            SAMPLE_HOST,
+            SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            connect_timeout=5.0,
+            init_timeout=5.0,
+            auto_reconnect=True,
+            reconnect_delay_min=0.05,
+        )
+        wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
+        await wp.connect()
+        assert len(calls) == 1
+        initial_ws = wp._ws
+        assert initial_ws is not None
+
+        # Drop the connection from the server side
+        for ws in list(mock_server._connections):
+            await ws.close()
+
+        for _ in range(60):
+            if not wp.connected:
+                break
+            await asyncio.sleep(0.01)
+        assert wp.connected is False
+
+        for _ in range(60):
+            await asyncio.sleep(0.05)
+            if wp._ws is not initial_ws and wp.connected:
+                break
+        assert wp._ws is not initial_ws
+        assert wp.connected is True
+        assert len(calls) == 1
+
+        await wp.disconnect()
+
+    async def test_hashing_offloaded_to_thread_responsiveness(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hashing runs in a worker thread and does not block the asyncio event loop."""
+        started_event = asyncio.Event()
+        progress_event = asyncio.Event()
+        release_gate = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def blocking_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            loop.call_soon_threadsafe(started_event.set)
+            release_gate.wait(timeout=5.0)
+            return b"test_hash"
+
+        monkeypatch.setattr(client_mod, "hash_password", blocking_hash)
+
+        wp = Wattpilot("host", "secret", serial="12345678")
+
+        async def background_progress() -> None:
+            await started_event.wait()
+            progress_event.set()
+
+        progress_task = asyncio.create_task(background_progress())
+        hash_task = asyncio.create_task(wp._ensure_hashed_password())
+
+        try:
+            await asyncio.wait_for(progress_event.wait(), timeout=3.0)
+            assert progress_event.is_set()
+        finally:
+            release_gate.set()
+            await hash_task
+            await progress_task
+
+        assert wp._hashed_password == b"test_hash"
+
+    async def test_hashing_failure_raises_authentication_error(
+        self, mock_server: MockWattpilotServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hashing failure raises AuthenticationError during connect and leaves cache key None."""
+
+        def failing_hash(pw: str, s: str, ht: AuthHashType) -> bytes:
+            raise RuntimeError("Hashing computation failed")
+
+        monkeypatch.setattr(client_mod, "hash_password", failing_hash)
+
+        wp = Wattpilot(
+            SAMPLE_HOST,
+            SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            connect_timeout=5.0,
+            init_timeout=5.0,
+        )
+        wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
+
+        with pytest.raises(AuthenticationError, match="Hashing computation failed"):
+            await wp.connect()
+
+        assert wp._hashed_password == b""
+        assert wp._hashed_password_key is None
+
+
+class TestAuthHandshakeConnectionDrop:
+    """Tests for issue #25: Connection drop during authentication and initialization."""
+
+    async def test_connection_drop_during_handshake_raises_connection_error(self) -> None:
+        """Transport abort during auth handshake raises ConnectionError and halts connect()."""
+        server_attempts = 0
+
+        async def handler(ws: Any) -> None:
+            nonlocal server_attempts
+            server_attempts += 1
+            await ws.send(json.dumps(SAMPLE_HELLO))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "authRequired",
+                        "token1": "a" * 32,
+                        "token2": "b" * 32,
+                        "hash": "pbkdf2",
+                    }
+                )
+            )
+            # Close connection abruptly without close frame
+            ws.transport.abort()
+
+        server = await websockets.asyncio.server.serve(handler, "127.0.0.1", 0)
+        port = next(s.getsockname()[1] for s in server.sockets)
+        try:
+            wp = Wattpilot(
+                "127.0.0.1",
+                "secret",
+                connect_timeout=10.0,
+                init_timeout=10.0,
+                auto_reconnect=True,
+                reconnect_delay_min=0.05,
+            )
+            wp._url = f"ws://127.0.0.1:{port}/ws"
+
+            with pytest.raises(
+                ConnectionError, match="Connection lost during authentication"
+            ) as exc_info:
+                await asyncio.wait_for(wp.connect(), timeout=3.0)
+
+            assert not isinstance(exc_info.value, AuthenticationError)
+            assert wp._auth_error is None
+            assert wp.connected is False
+            assert wp._message_loop_task is None
+            assert server_attempts == 1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_connection_drop_after_auth_success_before_status(self) -> None:
+        """Transport abort after authSuccess before fullStatus raises ConnectionError promptly."""
+
+        async def handler(ws: Any) -> None:
+            await ws.send(json.dumps(SAMPLE_HELLO))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "authRequired",
+                        "token1": "a" * 32,
+                        "token2": "b" * 32,
+                        "hash": "pbkdf2",
+                    }
+                )
+            )
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "auth":
+                    await ws.send(json.dumps(SAMPLE_AUTH_SUCCESS))
+                    # Abruptly drop transport before sending properties
+                    ws.transport.abort()
+                    break
+
+        server = await websockets.asyncio.server.serve(handler, "127.0.0.1", 0)
+        port = next(s.getsockname()[1] for s in server.sockets)
+        try:
+            wp = Wattpilot(
+                "127.0.0.1",
+                "secret",
+                connect_timeout=10.0,
+                init_timeout=10.0,
+            )
+            wp._url = f"ws://127.0.0.1:{port}/ws"
+
+            with pytest.raises(
+                ConnectionError, match="Connection lost before property initialization"
+            ):
+                await asyncio.wait_for(wp.connect(), timeout=3.0)
+
+            assert wp.connected is False
+            assert wp._message_loop_task is None
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_auth_error_after_auth_success_raises_authentication_error(self) -> None:
+        """authError sent with open socket raises AuthenticationError promptly."""
+
+        async def handler(ws: Any) -> None:
+            await ws.send(json.dumps(SAMPLE_HELLO))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "authRequired",
+                        "token1": "a" * 32,
+                        "token2": "b" * 32,
+                        "hash": "pbkdf2",
+                    }
+                )
+            )
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("type") == "auth":
+                    await ws.send(json.dumps(SAMPLE_AUTH_SUCCESS))
+                    await ws.send(json.dumps({"type": "authError", "message": "Late rejection"}))
+                    # keep socket open until client disconnects
+                    await ws.wait_closed()
+                    break
+
+        server = await websockets.asyncio.server.serve(handler, "127.0.0.1", 0)
+        port = next(s.getsockname()[1] for s in server.sockets)
+        try:
+            wp = Wattpilot(
+                "127.0.0.1",
+                "secret",
+                connect_timeout=10.0,
+                init_timeout=10.0,
+            )
+            wp._url = f"ws://127.0.0.1:{port}/ws"
+
+            with pytest.raises(AuthenticationError, match="Late rejection"):
+                await asyncio.wait_for(wp.connect(), timeout=3.0)
+
+            assert wp.connected is False
+            assert wp._message_loop_task is None
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_reconnect_on_transport_drop_during_handshake_when_not_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When not in initial connect, ConnectionClosed triggers auto-reconnect."""
+        wp = Wattpilot("host", "secret", auto_reconnect=True, reconnect_delay_min=0.01)
+        wp._handshake_pending = False
+
+        class HandshakeDropWS:
+            def __init__(self) -> None:
+                self.messages = [
+                    json.dumps(SAMPLE_HELLO),
+                    json.dumps(SAMPLE_AUTH_REQUIRED),
+                ]
+                self.index = 0
+
+            def __aiter__(self) -> HandshakeDropWS:
+                return self
+
+            async def __anext__(self) -> str:
+                if self.index < len(self.messages):
+                    msg = self.messages[self.index]
+                    self.index += 1
+                    return msg
+                raise StopAsyncIteration
+
+            async def send(self, data: str) -> None:
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+            async def close(self) -> None:
+                pass
+
+        wp._ws = HandshakeDropWS()  # type: ignore[assignment]
+
+        reconnect_attempts = 0
+
+        async def fake_connect(url: str) -> Any:
+            nonlocal reconnect_attempts
+            reconnect_attempts += 1
+            return HandshakeDropWS()
+
+        monkeypatch.setattr(websockets.asyncio.client, "connect", fake_connect)
+
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(delay: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+        task = asyncio.create_task(wp._message_loop())
+        for _ in range(50):
+            await real_sleep(0.01)
+            if reconnect_attempts >= 1:
+                break
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert wp._auth_error is None
+        assert reconnect_attempts >= 1
+        assert isinstance(wp._transport_error, websockets.exceptions.ConnectionClosed)
+
+    async def test_fake_socket_auth_error_no_reconnect(self) -> None:
+        """authError message stops the message loop with no reconnection attempts."""
+        wp = Wattpilot("host", "secret", auto_reconnect=True, reconnect_delay_min=0.01)
+
+        class AuthErrorWS:
+            def __init__(self) -> None:
+                self.messages = [
+                    json.dumps({"type": "authError", "message": "Denied"}),
+                ]
+                self.index = 0
+
+            def __aiter__(self) -> AuthErrorWS:
+                return self
+
+            async def __anext__(self) -> str:
+                if self.index < len(self.messages):
+                    msg = self.messages[self.index]
+                    self.index += 1
+                    return msg
+                # Keep socket open
+                await asyncio.sleep(10.0)
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                pass
+
+        wp._ws = AuthErrorWS()  # type: ignore[assignment]
+        await asyncio.wait_for(wp._message_loop(), timeout=1.0)
+        assert wp.connected is False
+        assert isinstance(wp._auth_error, AuthenticationError)
+
+    async def test_fake_socket_handshake_pending_drop_no_reconnect(self) -> None:
+        """When handshake_pending is True, ConnectionClosed stops loop without reconnecting."""
+        wp = Wattpilot("host", "secret", auto_reconnect=True, reconnect_delay_min=0.01)
+        wp._handshake_pending = True
+
+        class EndedDropWS:
+            def __aiter__(self) -> EndedDropWS:
+                return self
+
+            async def __anext__(self) -> str:
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+            async def close(self) -> None:
+                pass
+
+        wp._ws = EndedDropWS()  # type: ignore[assignment]
+        await asyncio.wait_for(wp._message_loop(), timeout=1.0)
+        assert wp.connected is False
+        assert wp._auth_error is None
+        assert isinstance(wp._transport_error, websockets.exceptions.ConnectionClosed)
+
+    async def test_reconnect_ignores_malformed_message_when_handshake_not_pending(self) -> None:
+        """Malformed message during background reconnect is logged and does not halt loop."""
+        wp = Wattpilot("host", "secret", auto_reconnect=False)
+        wp._handshake_pending = False
+        wp._connected_event.clear()
+
+        class MalformedThenSuccessWS:
+            def __init__(self) -> None:
+                self.messages = [
+                    "invalid-json{",
+                    json.dumps(SAMPLE_AUTH_SUCCESS),
+                ]
+                self.index = 0
+
+            def __aiter__(self) -> MalformedThenSuccessWS:
+                return self
+
+            async def __anext__(self) -> str:
+                if self.index < len(self.messages):
+                    msg = self.messages[self.index]
+                    self.index += 1
+                    return msg
+                raise websockets.exceptions.ConnectionClosedOK(None, None)
+
+            async def close(self) -> None:
+                pass
+
+        fake_ws = MalformedThenSuccessWS()
+        seen: list[str] = []
+        wp.on_message(lambda msg: seen.append(msg.get("type", "")))
+        wp._ws = fake_ws  # type: ignore[assignment]
+        await asyncio.wait_for(wp._message_loop(), timeout=1.0)
+        assert fake_ws.index == 2
+        assert "authSuccess" in seen
+        assert wp._auth_error is None
+        assert wp.connected is False
+
+    async def test_reconnect_stops_on_auth_error_exception_when_handshake_not_pending(self) -> None:
+        """AuthenticationError raised during background reconnect stops reconnection."""
+        wp = Wattpilot("host", "secret", auto_reconnect=True, reconnect_delay_min=0.01)
+        wp._handshake_pending = False
+        wp._connected_event.clear()
+
+        class RaisingWS:
+            def __aiter__(self) -> RaisingWS:
+                return self
+
+            async def __anext__(self) -> str:
+                return json.dumps({"type": "custom"})
+
+            async def close(self) -> None:
+                pass
+
+        async def raising_handle(raw: str) -> None:
+            raise AuthenticationError("Handshake auth failed")
+
+        wp._handle_message = raising_handle  # type: ignore[assignment]
+        wp._ws = RaisingWS()  # type: ignore[assignment]
+        await asyncio.wait_for(wp._message_loop(), timeout=1.0)
+        assert wp.connected is False
+        assert isinstance(wp._auth_error, AuthenticationError)
+
+    async def test_wait_for_connect_event_pre_finished_task(self) -> None:
+        """Cover _wait_for_connect_event when loop_task is None or already done."""
+        wp = Wattpilot("host", "secret")
+        wp._message_loop_task = None
+        wp._transport_error = RuntimeError("transport dropped")
+
+        event = asyncio.Event()
+        with pytest.raises(ConnectionError, match="lost") as exc_info:
+            await wp._wait_for_connect_event(event, 1.0, "timeout", "lost")
+        assert exc_info.value.__cause__ is wp._transport_error
+
+        # Now test with _auth_error already set
+        wp._auth_error = AuthenticationError("Pre-existing auth failure")
+        with pytest.raises(AuthenticationError, match="Pre-existing auth failure"):
+            await wp._wait_for_connect_event(event, 1.0, "timeout", "lost")
+
+    async def test_wait_for_connect_event_timeout(self) -> None:
+        """Cover _wait_for_connect_event timeout."""
+        wp = Wattpilot("host", "secret")
+
+        async def endless() -> None:
+            await asyncio.sleep(10.0)
+
+        task = asyncio.create_task(endless())
+        wp._message_loop_task = task
+        event = asyncio.Event()
+        try:
+            with pytest.raises(ConnectionError, match="Custom timeout message"):
+                await wp._wait_for_connect_event(event, 0.01, "Custom timeout message", "lost")
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 # ---- Issue #5: Additional typed properties ----
