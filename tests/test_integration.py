@@ -1,6 +1,6 @@
 """Integration tests against a real Wattpilot device.
 
-Run with: WATTPILOT_HOST=192.168.20.25 WATTPILOT_PASSWORD=29Lighthouse pytest -m integration -v
+Run with: WATTPILOT_HOST=<ip> WATTPILOT_PASSWORD=<password> pytest -m integration -v
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ class TestRealDeviceSetProperty:
             original_amp = wp.amp
             assert original_amp is not None
             # Set to same value — safe, no actual change
-            await wp.set_power(original_amp)
+            await wp.set_current(original_amp)
             # Allow a moment for the response
             await asyncio.sleep(0.5)
             assert wp.amp == original_amp
@@ -285,7 +285,7 @@ class TestRealDeviceTypeCoercion:
             original_amp = wp.amp
             assert original_amp is not None
             # Set via string — should be coerced to int
-            await wp.set_power(original_amp)
+            await wp.set_current(original_amp)
             await asyncio.sleep(0.5)
             assert wp.amp == original_amp
 
@@ -311,3 +311,16 @@ class TestRealDeviceNextTrip:
             # Restore original
             if original is not None:
                 await wp.set_property("fte", original)
+
+
+class TestRealDeviceAcknowledgement:
+    """Commands wait for the charger's acknowledgement (issue #38)."""
+
+    async def test_read_only_key_is_rejected(self, skip_if_no_device: None) -> None:
+        from wattpilot_api.exceptions import CommandError
+
+        async with Wattpilot(INTEGRATION_HOST, INTEGRATION_PASSWORD) as wp:
+            with pytest.raises(CommandError, match="no setter"):
+                await wp.set_property("fwv", "0.0")
+            # The connection stays usable after a rejection.
+            await wp.set_current(wp.amp)

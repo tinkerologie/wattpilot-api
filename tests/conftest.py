@@ -121,6 +121,10 @@ class MockWattpilotServer:
         self._connections: list[websockets.asyncio.server.ServerConnection] = []
         self.auth_success = True
         self.send_partial = False
+        # How setValue requests are answered: "accept", "reject", "reject_silent",
+        # "ignore" or "close"; string_request_ids echoes ids as strings like real firmware.
+        self.set_value_mode = "accept"
+        self.string_request_ids = False
 
     async def start(self) -> int:
         self._server = await websockets.asyncio.server.serve(self._handler, self.host, self.port)
@@ -135,6 +139,39 @@ class MockWattpilotServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+
+    async def _answer_set_value(
+        self, ws: websockets.asyncio.server.ServerConnection, msg: dict[str, Any]
+    ) -> None:
+        request_id = str(msg["requestId"]) if self.string_request_ids else msg["requestId"]
+        if self.set_value_mode == "accept":
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "response",
+                        "requestId": request_id,
+                        "success": True,
+                        "status": {msg["key"]: msg["value"]},
+                    }
+                )
+            )
+        elif self.set_value_mode == "reject":
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "response",
+                        "requestId": request_id,
+                        "success": False,
+                        "message": f"{msg['key']} has no setter",
+                    }
+                )
+            )
+        elif self.set_value_mode == "reject_silent":
+            await ws.send(
+                json.dumps({"type": "response", "requestId": request_id, "success": False})
+            )
+        elif self.set_value_mode == "close":
+            await ws.close()
 
     async def send_to_all(self, msg: dict[str, Any]) -> None:
         for ws in self._connections:
@@ -173,28 +210,9 @@ class MockWattpilotServer:
                             )
                         )
                 elif msg["type"] == "setValue":
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "response",
-                                "requestId": msg["requestId"],
-                                "success": True,
-                                "status": {msg["key"]: msg["value"]},
-                            }
-                        )
-                    )
+                    await self._answer_set_value(ws, msg)
                 elif msg["type"] == "securedMsg":
-                    inner = json.loads(msg["data"])
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "response",
-                                "requestId": inner["requestId"],
-                                "success": True,
-                                "status": {inner["key"]: inner["value"]},
-                            }
-                        )
-                    )
+                    await self._answer_set_value(ws, json.loads(msg["data"]))
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:

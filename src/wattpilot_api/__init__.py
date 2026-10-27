@@ -7,6 +7,7 @@ from wattpilot_api.discovery import HomeAssistantDiscovery
 from wattpilot_api.exceptions import (
     AuthenticationError,
     CommandError,
+    CommandTimeoutError,
     ConnectionError,
     PropertyError,
     WattpilotError,
@@ -34,6 +35,7 @@ __all__ = [
     "CarStatus",
     "CloudInfo",
     "CommandError",
+    "CommandTimeoutError",
     "ConnectionError",
     "DeviceInfo",
     "ErrorState",

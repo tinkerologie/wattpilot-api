@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import aiomqtt
 
 from wattpilot_api.definition import ApiDefinition, get_child_property_value
+from wattpilot_api.exceptions import WattpilotError
 from wattpilot_api.utils import JSONNamespaceEncoder
 
 if TYPE_CHECKING:
@@ -140,6 +141,8 @@ class MqttBridge:
         self._unsubscribe_props: Any = None
         self._unsubscribe_msgs: Any = None
         self._listen_task: asyncio.Task[None] | None = None
+        # Strong references keep fire-and-forget publish tasks alive until done
+        self._publish_tasks: set[asyncio.Task[None]] = set()
         self._properties: list[str] = list(config.properties) if config.properties else []
 
     @property
@@ -233,8 +236,14 @@ class MqttBridge:
         pd = self._api_def.properties.get(name)
         if pd is None:
             return
-        task = asyncio.ensure_future(self.publish_property(pd, value))
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        task = asyncio.create_task(self.publish_property(pd, value))
+        self._publish_tasks.add(task)
+        task.add_done_callback(self._on_publish_done)
+
+    def _on_publish_done(self, task: asyncio.Task[None]) -> None:
+        self._publish_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            _LOGGER.error("MQTT publish failed: %s", exc)
 
     async def _listen_loop(self) -> None:  # pragma: no cover
         """Listen for incoming MQTT set-value commands."""
@@ -267,7 +276,11 @@ class MqttBridge:
         )
         value = decode_property(pd, payload_str)
         _LOGGER.info("MQTT set command: %s = %s", name, value)
-        await self._wp.set_property(name, value)
+        try:
+            await self._wp.set_property(name, value)
+        except WattpilotError as exc:
+            # One rejected write must not stop processing further MQTT commands.
+            _LOGGER.error("MQTT set command for '%s' failed: %s", name, exc)
 
     def _subst(self, template: str, extra: dict[str, str]) -> str:
         return substitute_topic(

@@ -17,7 +17,13 @@ import websockets.asyncio.server
 
 import wattpilot_api.client as client_mod
 from wattpilot_api.client import Wattpilot
-from wattpilot_api.exceptions import AuthenticationError, ConnectionError, PropertyError
+from wattpilot_api.exceptions import (
+    AuthenticationError,
+    CommandError,
+    CommandTimeoutError,
+    ConnectionError,
+    PropertyError,
+)
 from wattpilot_api.models import AuthHashType, CloudInfo, LoadMode
 
 from .conftest import (
@@ -2393,3 +2399,180 @@ class TestFirmwareUpdate:
             await wp.disconnect()
             server.close()
             await server.wait_closed()
+
+
+class TestSetValueResponses:
+    """set_property waits for the charger's acknowledgement of its own request (#38)."""
+
+    async def test_acknowledged_write_updates_property(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.string_request_ids = True
+        await wattpilot_client.set_property("amp", 11)
+        assert wattpilot_client.amp == 11
+        assert wattpilot_client._pending_commands == {}
+
+    async def test_rejected_value_raises_with_charger_message(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "reject"
+        with pytest.raises(CommandError, match="fwv has no setter") as err:
+            await wattpilot_client.set_property("fwv", "1.0")
+        assert not isinstance(err.value, CommandTimeoutError)
+        assert wattpilot_client._pending_commands == {}
+
+    async def test_rejection_without_message_reports_unknown(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "reject_silent"
+        with pytest.raises(CommandError, match="unknown"):
+            await wattpilot_client.set_property("amp", 10)
+
+    async def test_helpers_raise_on_rejection(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "reject"
+        with pytest.raises(CommandError):
+            await wattpilot_client.set_current(8)
+        with pytest.raises(CommandError):
+            await wattpilot_client.set_mode(LoadMode.ECO)
+
+    async def test_missing_acknowledgement_times_out(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "ignore"
+        wattpilot_client._command_timeout = 0.2
+        with pytest.raises(CommandTimeoutError, match="amp"):
+            await wattpilot_client.set_property("amp", 10)
+        assert wattpilot_client._pending_commands == {}
+        # A late answer for the timed-out request is ignored.
+        wattpilot_client._on_response(
+            SimpleNamespace(type="response", requestId="1", success=False, message="late")
+        )
+
+    async def test_request_id_forms_match(self, wattpilot_client: Wattpilot) -> None:
+        loop = asyncio.get_running_loop()
+        plain: asyncio.Future[None] = loop.create_future()
+        signed: asyncio.Future[None] = loop.create_future()
+        wattpilot_client._pending_commands = {"7": plain, "8": signed}
+        wattpilot_client._on_response(
+            SimpleNamespace(type="response", requestId="7", success=True, status=SimpleNamespace())
+        )
+        wattpilot_client._on_response(
+            SimpleNamespace(type="response", requestId="8sm", success=True, status=None)
+        )
+        assert plain.done()
+        assert signed.done()
+
+    async def test_concurrent_writes_resolve_out_of_order(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "ignore"
+        first = asyncio.create_task(wattpilot_client.set_property("amp", 10))
+        second = asyncio.create_task(wattpilot_client.set_property("fna", "x"))
+        while len(wattpilot_client._pending_commands) < 2:
+            await asyncio.sleep(0.01)
+        ids = sorted(wattpilot_client._pending_commands, key=int)
+        wattpilot_client._on_response(
+            SimpleNamespace(type="response", requestId=ids[1], success=False, message="bad name")
+        )
+        wattpilot_client._on_response(
+            SimpleNamespace(
+                type="response",
+                requestId=ids[0],
+                success=True,
+                status=SimpleNamespace(amp=10),
+            )
+        )
+        await first
+        with pytest.raises(CommandError, match="bad name"):
+            await second
+        assert wattpilot_client.amp == 10
+
+    async def test_connection_loss_fails_pending_command(
+        self, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "close"
+        wp = Wattpilot(
+            host=f"127.0.0.1:{mock_server.port}",
+            password=SAMPLE_PASSWORD,
+            serial=SAMPLE_SERIAL,
+            auto_reconnect=False,
+        )
+        wp._url = f"ws://127.0.0.1:{mock_server.port}/ws"
+        await wp.connect()
+        try:
+            with pytest.raises(ConnectionError, match="Connection closed"):
+                await wp.set_property("amp", 10)
+        finally:
+            await wp.disconnect()
+
+    async def test_disconnect_fails_pending_command(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "ignore"
+        request = asyncio.create_task(wattpilot_client.set_property("amp", 10))
+        while not wattpilot_client._pending_commands:
+            await asyncio.sleep(0.01)
+        await wattpilot_client.disconnect()
+        with pytest.raises(ConnectionError, match="Disconnected"):
+            await request
+
+    async def test_send_failure_removes_pending_entry(self, wattpilot_client: Wattpilot) -> None:
+        with (
+            patch.object(wattpilot_client, "_send", side_effect=ConnectionError("Not connected")),
+            pytest.raises(ConnectionError),
+        ):
+            await wattpilot_client.set_property("amp", 10)
+        assert wattpilot_client._pending_commands == {}
+
+    async def test_cancelled_caller_removes_pending_entry(
+        self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
+    ) -> None:
+        mock_server.set_value_mode = "ignore"
+        request = asyncio.create_task(wattpilot_client.set_property("amp", 10))
+        while not wattpilot_client._pending_commands:
+            await asyncio.sleep(0.01)
+        request.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await request
+        assert wattpilot_client._pending_commands == {}
+
+    async def test_unsolicited_responses(self, wattpilot_client: Wattpilot) -> None:
+        wattpilot_client._on_response(
+            SimpleNamespace(
+                type="response", requestId="41", success=True, status=SimpleNamespace(amp=7)
+            )
+        )
+        assert wattpilot_client.amp == 7
+        with patch.object(client_mod._LOGGER, "error") as log_error:
+            wattpilot_client._on_response(
+                SimpleNamespace(type="response", requestId="42", success=False, message="no")
+            )
+        log_error.assert_called_once()
+
+    async def test_fail_pending_commands_is_idempotent(self, wattpilot_client: Wattpilot) -> None:
+        done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        done.cancel()
+        wattpilot_client._pending_commands = {"9": done}
+        wattpilot_client._fail_pending_commands(ConnectionError("closing"))
+        wattpilot_client._fail_pending_commands(ConnectionError("closing"))
+        wattpilot_client._pending_commands = {"10": done}
+        wattpilot_client._on_response(
+            SimpleNamespace(type="response", requestId="10", success=True)
+        )
+        assert done.cancelled()
+
+
+class TestCallbackTasks:
+    async def test_async_callback_failure_is_logged(self, wattpilot_client: Wattpilot) -> None:
+        async def broken(name: str, value: Any) -> None:
+            raise RuntimeError("callback bug")
+
+        wattpilot_client.on_property_change(broken)
+        with patch.object(client_mod._LOGGER, "error") as log_error:
+            wattpilot_client._update_property("amp", 12)
+            for _ in range(5):
+                await asyncio.sleep(0)
+        log_error.assert_called_once()
+        assert wattpilot_client._background_tasks == set()
