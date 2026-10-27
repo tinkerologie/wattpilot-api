@@ -2412,6 +2412,17 @@ class TestSetValueResponses:
         assert wattpilot_client.amp == 11
         assert wattpilot_client._pending_commands == {}
 
+    async def test_failing_sync_callback_does_not_fail_accepted_write(
+        self, wattpilot_client: Wattpilot
+    ) -> None:
+        def broken(name: str, value: Any) -> None:
+            raise RuntimeError("callback bug")
+
+        wattpilot_client.on_property_change(broken)
+        wattpilot_client._command_timeout = 2.0
+        await wattpilot_client.set_property("amp", 9)
+        assert wattpilot_client.amp == 9
+
     async def test_rejected_value_raises_with_charger_message(
         self, wattpilot_client: Wattpilot, mock_server: MockWattpilotServer
     ) -> None:

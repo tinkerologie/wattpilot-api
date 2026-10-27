@@ -1158,12 +1158,14 @@ class Wattpilot:
         request_id = getattr(msg, "requestId", None)
         pending = self._pending_commands.get(self._normalize_request_id(request_id))
         if msg.success:
+            # Resolve first: a failing property callback must not turn an accepted
+            # write into a timeout. The caller resumes only after this returns.
+            if pending is not None and not pending.done():
+                pending.set_result(None)
             status = getattr(msg, "status", None)
             if isinstance(status, SimpleNamespace):
                 for name, value in status.__dict__.items():
                     self._update_property(name, value)
-            if pending is not None and not pending.done():
-                pending.set_result(None)
             return
 
         message = getattr(msg, "message", None) or "unknown"
