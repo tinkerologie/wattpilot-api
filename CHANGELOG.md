@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-27
+
+### Changed
+- `set_property` and every helper built on it (`set_current`, `set_power`, `set_dynamic_current`, `set_mode`, `set_next_trip`, `set_next_trip_energy`, `enable_cloud_api`, `disable_cloud_api`, `install_firmware_update`) now wait for the charger's acknowledgement of the `setValue` request. They raise `CommandError` with the charger's message when the charger rejects the value, `CommandTimeoutError` when no acknowledgement arrives in time, and `ConnectionError` when the connection closes or `disconnect()` is called first ([#38](https://github.com/tinkerologie/wattpilot-api/issues/38)). Previously a rejection was only logged, and the caller could not tell that the change was not applied.
+
+- Python 3.15 is supported and tested in CI (3.12 to 3.15). The test suite fails on any warning, so deprecated APIs are caught on every supported Python version.
+- Removed the unused `pydantic` runtime dependency and its mypy plugin settings.
+- Removed the `License ::` classifier, which PEP 639 deprecates when `license` is an SPDX expression.
+- Async property callbacks and MQTT publishes are scheduled with `asyncio.create_task` and kept referenced until they finish, as the asyncio documentation requires; failures are logged instead of silently discarded.
+- The integration tests use `set_current` instead of the deprecated `set_power`.
+
+### Added
+- `command_timeout` constructor option (default 10 seconds) for the acknowledgement wait.
+- `CommandTimeoutError`, a subclass of `CommandError`.
+
+### Fixed
+- The MQTT bridge logs a rejected write and keeps processing further set commands.
+- The integration test instructions no longer contain device credentials.
+
 ## [1.5.1] - 2026-10-19
 
 ### Changed

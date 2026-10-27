@@ -3,6 +3,7 @@
 from wattpilot_api.exceptions import (
     AuthenticationError,
     CommandError,
+    CommandTimeoutError,
     ConnectionError,
     PropertyError,
     WattpilotError,
@@ -35,6 +36,17 @@ class TestExceptionHierarchy:
         exc = CommandError("cmd failed")
         assert isinstance(exc, WattpilotError)
         assert str(exc) == "cmd failed"
+
+    def test_command_timeout_error(self) -> None:
+        exc = CommandTimeoutError("no ack")
+        assert isinstance(exc, CommandError)
+        assert isinstance(exc, WattpilotError)
+
+    def test_command_timeout_error_is_exported(self) -> None:
+        import wattpilot_api
+
+        assert wattpilot_api.CommandTimeoutError is CommandTimeoutError
+        assert "CommandTimeoutError" in wattpilot_api.__all__
 
     def test_catch_base_catches_all(self) -> None:
         for exc_cls in (ConnectionError, AuthenticationError, PropertyError, CommandError):

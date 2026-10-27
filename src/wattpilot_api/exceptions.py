@@ -19,3 +19,7 @@ class PropertyError(WattpilotError):
 
 class CommandError(WattpilotError):
     """Raised when a command sent to the Wattpilot device fails."""
+
+
+class CommandTimeoutError(CommandError):
+    """Raised when the Wattpilot device does not acknowledge a command in time."""

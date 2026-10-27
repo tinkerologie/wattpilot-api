@@ -24,6 +24,8 @@ from wattpilot_api.auth import (
 from wattpilot_api.definition import ApiDefinition, load_api_definition
 from wattpilot_api.exceptions import (
     AuthenticationError,
+    CommandError,
+    CommandTimeoutError,
     ConnectionError,
     PropertyError,
 )
@@ -60,6 +62,7 @@ class Wattpilot:
         auto_reconnect: bool = True,
         reconnect_delay_min: float = 5.0,
         reconnect_delay_max: float = 300.0,
+        command_timeout: float = 10.0,
     ) -> None:
         self._host = host
         self._password = password
@@ -69,6 +72,7 @@ class Wattpilot:
         self._auto_reconnect = auto_reconnect
         self._reconnect_delay_min = reconnect_delay_min
         self._reconnect_delay_max = reconnect_delay_max
+        self._command_timeout = command_timeout
 
         self._device = DeviceInfo(serial=serial or "")
         self._hashed_password: bytes = b""
@@ -128,8 +132,13 @@ class Wattpilot:
         # Lazy-loaded API definition for type coercion
         self._api_def_cache: ApiDefinition | None = None
 
+        # setValue commands awaiting the charger's acknowledgement, by request id
+        self._pending_commands: dict[str, asyncio.Future[None]] = {}
+
         # Callbacks
         self._property_callbacks: list[PropertyCallback] = []
+        # Strong references keep fire-and-forget callback tasks alive until done
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._message_callbacks: list[MessageCallback] = []
 
     # ---- Context manager ----
@@ -258,6 +267,9 @@ class Wattpilot:
 
     async def disconnect(self) -> None:
         """Close the WebSocket connection."""
+        self._fail_pending_commands(
+            ConnectionError("Disconnected before the command was acknowledged")
+        )
         if self._message_loop_task is not None:
             self._message_loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -671,17 +683,35 @@ class Wattpilot:
 
         Values are automatically coerced to the type expected by the charger
         protocol (based on the API definition's ``jsonType``).
+
+        Waits for the charger's acknowledgement. Raises :class:`CommandError` when
+        the charger rejects the value, :class:`CommandTimeoutError` when it does not
+        answer within ``command_timeout``, and :class:`ConnectionError` when the
+        connection closes first.
         """
         value = self._coerce_value(name, value)
         self._request_id += 1
+        request_id = self._request_id
         message: dict[str, Any] = {
             "type": "setValue",
-            "requestId": self._request_id,
+            "requestId": request_id,
             "key": name,
             "value": value,
         }
         secure = self._device.secured is not None and self._device.secured > 0
-        await self._send(message, secure=secure)
+        key = self._normalize_request_id(request_id)
+        acknowledgement: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._pending_commands[key] = acknowledgement
+        try:
+            await self._send(message, secure=secure)
+            try:
+                async with asyncio.timeout(self._command_timeout):
+                    await acknowledgement
+            except TimeoutError as exc:
+                msg = f"No acknowledgement for {name} (requestId={request_id})"
+                raise CommandTimeoutError(msg) from exc
+        finally:
+            self._pending_commands.pop(key, None)
 
     async def set_current(self, amperage: int) -> None:
         """Set the charging current in amperes (persisted to EEPROM)."""
@@ -750,7 +780,8 @@ class Wattpilot:
 
         Returns a :class:`CloudInfo` with the API key and URL.
         Raises :class:`ConnectionError` if the API key is not received
-        within *timeout* seconds.
+        within *timeout* seconds. The write itself is acknowledged within
+        ``command_timeout`` (see :meth:`set_property`).
         """
         await self.set_property("cae", True)
 
@@ -782,7 +813,8 @@ class Wattpilot:
 
         If *version* is not specified, the first available version is used.
         Raises :class:`PropertyError` if no updates are available.
-        Raises :class:`ConnectionError` on timeout.
+        Raises :class:`ConnectionError` on timeout. *timeout* covers the reboot;
+        the ``oct`` write is acknowledged within ``command_timeout``.
         """
         if version is None:
             versions = self.available_firmware_versions
@@ -947,10 +979,16 @@ class Wattpilot:
                     _LOGGER.info("WebSocket connection closed")
                     self._transport_error = exc
                     self._transport_drop_event.set()
+                    lost = ConnectionError("Connection closed before the command was acknowledged")
+                    lost.__cause__ = exc
+                    self._fail_pending_commands(lost)
                 else:
                     if self._auth_error is None:
                         _LOGGER.info("WebSocket connection closed normally")
                         self._transport_drop_event.set()
+                    self._fail_pending_commands(
+                        ConnectionError("Connection closed before the command was acknowledged")
+                    )
 
                 self._connected = False
                 if not self._handshake_pending and self._auth_error is None:
@@ -984,6 +1022,9 @@ class Wattpilot:
             self._connected = False
             if not self._handshake_pending and self._auth_error is None:
                 self._connected_event.clear()
+            self._fail_pending_commands(
+                ConnectionError("Connection closed before the command was acknowledged")
+            )
 
     async def _handle_message(self, raw: str) -> None:
         _LOGGER.debug("Message received: %s", raw)
@@ -1108,17 +1149,41 @@ class Wattpilot:
         for key, value in props.items():
             self._update_property(key, value)
 
+    @staticmethod
+    def _normalize_request_id(request_id: Any) -> str:
+        """Match ids sent as int, echoed as str, or wrapped as "<id>sm" when signed."""
+        return str(request_id).removesuffix("sm")
+
     def _on_response(self, msg: SimpleNamespace) -> None:
+        request_id = getattr(msg, "requestId", None)
+        pending = self._pending_commands.get(self._normalize_request_id(request_id))
         if msg.success:
-            props = msg.status.__dict__
-            for key, value in props.items():
-                self._update_property(key, value)
-        else:
-            _LOGGER.error(
-                "Command failed (requestId=%s): %s",
-                msg.requestId,
-                getattr(msg, "message", "unknown"),
+            # Resolve first: a failing property callback must not turn an accepted
+            # write into a timeout. The caller resumes only after this returns.
+            if pending is not None and not pending.done():
+                pending.set_result(None)
+            status = getattr(msg, "status", None)
+            if isinstance(status, SimpleNamespace):
+                for name, value in status.__dict__.items():
+                    self._update_property(name, value)
+            return
+
+        message = getattr(msg, "message", None) or "unknown"
+        if pending is None:
+            _LOGGER.error("Command failed (requestId=%s): %s", request_id, message)
+            return
+        _LOGGER.debug("Command rejected (requestId=%s): %s", request_id, message)
+        if not pending.done():
+            pending.set_exception(
+                CommandError(f"Charger rejected the command (requestId={request_id}): {message}")
             )
+
+    def _fail_pending_commands(self, exc: BaseException) -> None:
+        """Fail every command still awaiting acknowledgement; safe to call repeatedly."""
+        pending, self._pending_commands = self._pending_commands, {}
+        for future in pending.values():
+            if not future.done():
+                future.set_exception(exc)
 
     def _update_property(self, name: str, value: Any) -> None:
         self._all_props[name] = value
@@ -1181,10 +1246,16 @@ class Wattpilot:
         # Fire property callbacks
         for cb in self._property_callbacks:
             if inspect.iscoroutinefunction(cb):
-                task = asyncio.ensure_future(cb(name, value))
-                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                task = asyncio.create_task(cb(name, value))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._on_callback_task_done)
             else:
                 cb(name, value)
+
+    def _on_callback_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            _LOGGER.error("Property callback failed: %s", exc, exc_info=exc)
 
     async def _ensure_hashed_password(self) -> None:
         """Ensure password hash is computed and cached for current credentials."""

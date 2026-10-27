@@ -15,11 +15,11 @@ authors = [
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: 3 :: Only",
     "Framework :: AsyncIO",
     "Topic :: Home Automation",
@@ -31,7 +31,6 @@ dependencies = [
     "aiomqtt>=2.0",
     "bcrypt>=4.0",
     "prompt-toolkit>=3.0",
-    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +65,9 @@ packages = ["src/wattpilot_api"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Any warning (including deprecations from newer Python releases) fails the suite.
+filterwarnings = ["error"]
 testpaths = ["tests"]
 markers = [
     "integration: marks tests that require a real Wattpilot device",
@@ -97,13 +99,7 @@ python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
-plugins = ["pydantic.mypy"]
 
 [tool.bandit]
 exclude_dirs = ["tests"]
 skips = ["B101"]
-
-[tool.pydantic-mypy]
-init_typed = true
-init_forbid_extra = true
-warn_required_dynamic_aliases = true

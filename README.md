@@ -127,6 +127,7 @@ wp = Wattpilot(
     cloud=False,  # True for Fronius cloud connection
     connect_timeout=30.0,  # seconds
     init_timeout=30.0,  # seconds
+    command_timeout=10.0,  # seconds to wait for a command acknowledgement
 )
 
 # Connect / disconnect
@@ -174,6 +175,11 @@ await wp.set_mode(LoadMode.ECO)  # Set charging mode
 await wp.set_property("fna", "MyCharger")  # Set any writable property
 ```
 
+Commands wait for the charger's acknowledgement. They raise `CommandError` when the
+charger rejects the value (for example a read-only key), `CommandTimeoutError` when no
+acknowledgement arrives within `command_timeout`, and `ConnectionError` when the
+connection closes first.
+
 ### Callbacks
 
 ```python
@@ -184,6 +190,10 @@ unsub()  # unsubscribe
 unsub = wp.on_message(lambda msg: print(msg["type"]))
 unsub()
 ```
+
+Async `on_message` callbacks run inline in the receive loop. Do not `await` a command
+(such as `set_property`) inside one: its acknowledgement cannot arrive while the loop is
+blocked, so the command times out. Schedule it with `asyncio.create_task()` instead.
 
 ### Enums
 
@@ -197,7 +207,13 @@ CarStatus(wp.car_connected)  # CarStatus.NO_CAR / CHARGING / READY / COMPLETE
 ### Exceptions
 
 ```python
-from wattpilot_api import WattpilotError, AuthenticationError, ConnectionError
+from wattpilot_api import (
+    AuthenticationError,
+    CommandError,
+    CommandTimeoutError,
+    ConnectionError,
+    WattpilotError,
+)
 
 try:
     await wp.connect()
@@ -205,6 +221,13 @@ except AuthenticationError:
     print("Device or local credentials rejected authentication")
 except ConnectionError:
     print("Cannot reach device or connection lost during handshake")
+
+try:
+    await wp.set_property("amp", 16)
+except CommandTimeoutError:
+    print("The charger did not acknowledge the command in time")
+except CommandError as err:
+    print(f"The charger rejected the command: {err}")
 ```
 
 ## MQTT Bridge

@@ -437,9 +437,25 @@ class TestMqttBridgeOnPropertyChange:
         bridge._client = MagicMock()
         bridge._client.publish = AsyncMock()
 
-        # Should schedule publish (needs running event loop for ensure_future)
+        # Should schedule publish (needs a running event loop for create_task)
         bridge._on_property_change("amp", 16)
-        await asyncio.sleep(0)  # let the scheduled coroutine run
+        for _ in range(5):  # let the task and its done-callback run
+            await asyncio.sleep(0)
+        bridge._client.publish.assert_awaited()
+        assert bridge._publish_tasks == set()
+
+    async def test_on_property_change_publish_failure_is_logged(self) -> None:
+        wp = _make_mock_wp()
+        bridge = MqttBridge(wp, _make_config(), _make_api_def())
+        bridge._client = MagicMock()
+        bridge._client.publish = AsyncMock(side_effect=RuntimeError("broker gone"))
+
+        with patch("wattpilot_api.mqtt._LOGGER") as logger:
+            bridge._on_property_change("amp", 16)
+            for _ in range(5):
+                await asyncio.sleep(0)
+        logger.error.assert_called_once()
+        assert bridge._publish_tasks == set()
 
 
 class TestMqttBridgeOnMqttMessage:
@@ -453,6 +469,22 @@ class TestMqttBridgeOnMqttMessage:
 
         await bridge._on_mqtt_message(msg)
         wp.set_property.assert_called_once_with("amp", 10)
+
+    async def test_set_value_rejected_is_logged_and_contained(self) -> None:
+        from wattpilot_api.exceptions import CommandError
+
+        wp = _make_mock_wp()
+        wp.set_property = AsyncMock(side_effect=CommandError("amp out of range"))
+        bridge = MqttBridge(wp, _make_config(), _make_api_def())
+
+        msg = MagicMock()
+        msg.topic = "wattpilot/properties/amp/set"
+        msg.payload = b"99"
+
+        with patch("wattpilot_api.mqtt._LOGGER") as logger:
+            await bridge._on_mqtt_message(msg)
+        logger.error.assert_called_once()
+        assert "amp out of range" in str(logger.error.call_args)
 
     async def test_set_value_readonly(self) -> None:
         wp = _make_mock_wp()
