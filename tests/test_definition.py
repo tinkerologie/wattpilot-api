@@ -105,6 +105,17 @@ class TestLoadApiDefinition:
         assert len(api_def.properties) > 0
         assert "amp" in api_def.properties
 
+    def test_pdt_property_definition(self) -> None:
+        api_def = load_api_definition()
+        assert "pdt" in api_def.properties
+        pdt = api_def.properties["pdt"]
+        assert pdt["jsonType"] == "integer"
+        assert pdt["rw"] == "R/W"
+        assert pdt["type"] == "uint8"
+        assert pdt["homeAssistant"]["component"] == "number"
+        assert pdt["homeAssistant"]["config"]["min"] == 0
+        assert pdt["homeAssistant"]["config"]["max"] == 100
+
     def test_load_without_split(self) -> None:
         api_def = load_api_definition(split_properties=False)
         assert len(api_def.split_properties) == 0

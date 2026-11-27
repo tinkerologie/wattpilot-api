@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `pdt` (PV Battery Discharges Until) property definition with `jsonType: integer` and Home Assistant discovery metadata to `wattpilot.yaml`, ensuring `set_property("pdt", ...)` coerces numeric inputs to `int` (`uint8`) ([#46](https://github.com/tinkerologie/wattpilot-api/issues/46)).
+
 ## [1.6.0] - 2026-10-27
 
 ### Changed

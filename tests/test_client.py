@@ -1947,6 +1947,15 @@ class TestTypeCoercion:
         wp = Wattpilot("host", "pw")
         assert wp._coerce_value("amp", 16.7) == 16
 
+    def test_coerce_pdt_to_int(self) -> None:
+        wp = Wattpilot("host", "pw")
+        from_float = wp._coerce_value("pdt", 49.0)
+        assert from_float == 49
+        assert type(from_float) is int
+        from_str = wp._coerce_value("pdt", "49")
+        assert from_str == 49
+        assert type(from_str) is int
+
     def test_coerce_int_from_string(self) -> None:
         wp = Wattpilot("host", "pw")
         assert wp._coerce_value("amp", "16") == 16
