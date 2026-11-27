@@ -2323,6 +2323,24 @@ properties:
     type: array
     category: Constant
     description: partition table
+  - key: pdt
+    alias: pvBatteryDischargesUntil
+    title: PV Battery Discharges Until
+    jsonType: integer
+    example: 20
+    rw: R/W
+    type: uint8
+    category: Config
+    description: Percentage to which the PV battery is discharged in the vehicle during PV surplus charging
+    homeAssistant:
+      component: number
+      config:
+        device_class: battery
+        entity_category: config
+        unit_of_measurement: "%"
+        min: 0
+        max: 100
+        step: 1
   - key: pgrid
     alias: pGrid
     title: Power Grid
